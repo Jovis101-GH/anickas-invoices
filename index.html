@@ -797,9 +797,6 @@ function nextInvoiceNumber(dateStr){
   const next=(seq[key]||0)+1;
   return {number:key+String(next).padStart(2,'0'), key, next};
 }
-function commitInvoiceNumber(key, next){
-  const seq=loadSeq(); seq[key]=next; saveSeq(seq);
-}
 
 function uid(){ return 'i'+Date.now()+Math.random().toString(16).slice(2,8); }
 function fmtMoney(n){ return 'R'+ (Math.round((n||0)*100)/100).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2}); }
@@ -1075,6 +1072,44 @@ function progress(step){
   for(let i=1;i<=3;i++){ const s=document.createElement('span'); if(i<=step) s.className='done'; p.appendChild(s); }
   return p;
 }
+function numberBanner(d){
+  const bar=document.createElement('div');
+  bar.style.cssText='margin:14px 20px 0;padding:10px 14px;border-radius:10px;background:#F7ECEE;border:1px solid var(--berry);text-align:center;';
+  if(state.editingId){
+    bar.innerHTML=`<span style="font-family:'Fraunces';font-style:italic;color:var(--berry-dark);font-weight:600;">Editing Invoice #${escapeHtml(d.number||'')}</span>`;
+    return bar;
+  }
+  const preview = d.manualNumber || nextInvoiceNumber(d.date).number;
+  function showDisplay(){
+    bar.innerHTML=`
+      <span style="font-family:'Fraunces';font-style:italic;color:var(--berry-dark);font-weight:600;">Next up: #${escapeHtml(preview)}</span>
+      <span style="font-size:12px;color:var(--ink-soft);">(assigned when you save)</span>
+      <button id="number-edit-link" style="display:block;margin:6px auto 0;border:none;background:none;color:var(--berry-dark);font-size:12px;font-weight:600;text-decoration:underline;cursor:pointer;">Not the right number? Fix it</button>
+    `;
+    bar.querySelector('#number-edit-link').onclick=showEditor;
+  }
+  function showEditor(){
+    bar.innerHTML=`
+      <label style="margin-top:0;font-size:11px;text-align:center;">Set invoice number manually</label>
+      <input type="text" id="number-manual-input" value="${escapeAttr(preview)}" inputmode="numeric" style="text-align:center;font-family:'Fraunces';font-style:italic;font-weight:600;color:var(--berry-dark);">
+      <p class="hint" style="margin-top:6px;">Use this if another device already used this number — future invoices on this device will continue after whatever you set here.</p>
+      <div class="row2" style="margin-top:8px;">
+        <button class="btn-secondary" id="number-manual-cancel" style="margin-top:0;">Cancel</button>
+        <button class="btn-secondary" id="number-manual-confirm" style="margin-top:0;background:var(--berry);color:#fff;">Use This Number</button>
+      </div>
+    `;
+    bar.querySelector('#number-manual-cancel').onclick=showDisplay;
+    bar.querySelector('#number-manual-confirm').onclick=()=>{
+      const val=bar.querySelector('#number-manual-input').value.trim();
+      if(!/^\d{6}$/.test(val)){ showToast('Enter a 6-digit number like 260706'); return; }
+      if(loadInvoices().some(i=>i.number===val)){ showToast('That number is already used by an invoice on this device'); return; }
+      d.manualNumber=val;
+      render();
+    };
+  }
+  showDisplay();
+  return bar;
+}
 
 /* ---------- THIS WEEK'S BAKES (quick-start) ---------- */
 function renderWeeklyBakes(app){
@@ -1142,6 +1177,7 @@ function renderStep1(app){
     render();
   }));
   app.appendChild(progress(1));
+  app.appendChild(numberBanner(d));
   const content=document.createElement('div'); content.className='content';
 
   const isBiz=d.type==='business';
@@ -1315,6 +1351,7 @@ function renderStep2(app){
   const d=state.draft;
   app.appendChild(backRow('Items', ()=>{state.view='step1'; render();}));
   app.appendChild(progress(2));
+  app.appendChild(numberBanner(d));
   const content=document.createElement('div'); content.className='content';
   content.id='items-content';
   app.appendChild(content);
@@ -1878,6 +1915,7 @@ function renderStep3(app){
   const d=state.draft;
   app.appendChild(backRow('Review & Save', ()=>{state.view='step2'; render();}));
   app.appendChild(progress(3));
+  app.appendChild(numberBanner(d));
   const content=document.createElement('div'); content.className='content';
   const subtotal=computeSubtotal(d.items);
 
@@ -1931,10 +1969,17 @@ function renderStep3(app){
       showToast('Invoice #'+displayInvoiceNumber(d)+' updated'+(newMenuCount?' · '+newMenuCount+' new menu item'+(newMenuCount>1?'s':'')+' saved':''));
       state.viewingId=d.id; state.editingId=null; state.draft=null; state.view='detail'; render();
     } else {
-      const {number,key,next}=nextInvoiceNumber(d.date);
+      let number, key, next;
+      if(d.manualNumber){
+        number=d.manualNumber;
+        key=number.slice(0,4);
+        next=parseInt(number.slice(4,6),10);
+      } else {
+        ({number,key,next}=nextInvoiceNumber(d.date));
+      }
       d.number=number; d.id=uid();
       list.push(d); saveInvoices(list);
-      commitInvoiceNumber(key,next);
+      const seq=loadSeq(); seq[key]=Math.max(seq[key]||0, next); saveSeq(seq);
       generatePDF(d);
       showToast((d.docType==='proforma'?'Quote #':'Invoice #')+number+' saved'+(newMenuCount?' · '+newMenuCount+' new menu item'+(newMenuCount>1?'s':'')+' saved':''));
       state.viewingId=d.id; state.draft=null; state.view='detail'; render();
