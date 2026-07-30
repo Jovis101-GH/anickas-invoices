@@ -609,6 +609,153 @@ input:focus,textarea:focus,select:focus{outline:2px solid var(--berry);outline-o
 <div class="toast" id="toast"></div>
 
 <script>
+/* ---------- cloud backup (Firestore REST, no SDK bundling needed) ---------- */
+const CLOUD_ENABLED=true;
+const FIREBASE_CONFIG={ apiKey:"AIzaSyAIfAU5ZW2dxnE8lRU6TOyVoanLx0SgqEA", projectId:"anickas-invoices" };
+const CLOUD_SYNC_STATUS_KEY='anickas_cloud_sync_status_v1';
+const CLOUD_MIGRATED_KEY='anickas_cloud_migrated_v1';
+const FS_BASE=`https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents`;
+
+function fsToValue(v){
+  if(v===null||v===undefined) return {nullValue:null};
+  if(typeof v==='string') return {stringValue:v};
+  if(typeof v==='boolean') return {booleanValue:v};
+  if(typeof v==='number') return Number.isInteger(v) ? {integerValue:String(v)} : {doubleValue:v};
+  if(Array.isArray(v)) return {arrayValue:{values:v.map(fsToValue)}};
+  if(typeof v==='object') return {mapValue:{fields:fsToFields(v)}};
+  return {stringValue:String(v)};
+}
+function fsToFields(obj){
+  const fields={};
+  Object.keys(obj||{}).forEach(k=>{ fields[k]=fsToValue(obj[k]); });
+  return fields;
+}
+function fsFromValue(v){
+  if(!v) return null;
+  if('nullValue' in v) return null;
+  if('stringValue' in v) return v.stringValue;
+  if('booleanValue' in v) return v.booleanValue;
+  if('integerValue' in v) return parseInt(v.integerValue,10);
+  if('doubleValue' in v) return v.doubleValue;
+  if('arrayValue' in v) return (v.arrayValue.values||[]).map(fsFromValue);
+  if('mapValue' in v) return fsFromFields(v.mapValue.fields||{});
+  if('timestampValue' in v) return v.timestampValue;
+  return null;
+}
+function fsFromFields(fields){
+  const obj={};
+  Object.keys(fields||{}).forEach(k=>{ obj[k]=fsFromValue(fields[k]); });
+  return obj;
+}
+async function fsSetDoc(collection, docId, dataObj){
+  const url=`${FS_BASE}/${collection}/${encodeURIComponent(docId)}?key=${FIREBASE_CONFIG.apiKey}`;
+  const res=await fetch(url, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({fields: fsToFields(dataObj)}) });
+  if(!res.ok) throw new Error('Firestore write failed: '+res.status);
+  return res.json();
+}
+async function fsDeleteDoc(collection, docId){
+  const url=`${FS_BASE}/${collection}/${encodeURIComponent(docId)}?key=${FIREBASE_CONFIG.apiKey}`;
+  const res=await fetch(url, {method:'DELETE'});
+  if(!res.ok && res.status!==404) throw new Error('Firestore delete failed: '+res.status);
+}
+async function fsGetDoc(collection, docId){
+  const url=`${FS_BASE}/${collection}/${encodeURIComponent(docId)}?key=${FIREBASE_CONFIG.apiKey}`;
+  const res=await fetch(url);
+  if(res.status===404) return null;
+  if(!res.ok) throw new Error('Firestore get failed: '+res.status);
+  const data=await res.json();
+  return fsFromFields(data.fields||{});
+}
+async function fsListCollection(collection){
+  let docs=[], pageToken=null;
+  do{
+    let url=`${FS_BASE}/${collection}?key=${FIREBASE_CONFIG.apiKey}&pageSize=300`;
+    if(pageToken) url+=`&pageToken=${encodeURIComponent(pageToken)}`;
+    const res=await fetch(url);
+    if(!res.ok) throw new Error('Firestore list failed: '+res.status);
+    const data=await res.json();
+    (data.documents||[]).forEach(d=>{
+      const id=d.name.split('/').pop();
+      docs.push({id, data: fsFromFields(d.fields||{})});
+    });
+    pageToken=data.nextPageToken||null;
+  } while(pageToken);
+  return docs;
+}
+async function fsBatchWrite(writes){
+  const url=`https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents:commit?key=${FIREBASE_CONFIG.apiKey}`;
+  const res=await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({writes}) });
+  if(!res.ok) throw new Error('Firestore batch write failed: '+res.status);
+  return res.json();
+}
+function docName(collection, id){ return `projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/${collection}/${id}`; }
+
+function getCloudSyncStatus(){ try{ return JSON.parse(localStorage.getItem(CLOUD_SYNC_STATUS_KEY))||{}; }catch(e){ return {}; } }
+function setCloudSyncStatus(patch){ const cur=getCloudSyncStatus(); localStorage.setItem(CLOUD_SYNC_STATUS_KEY, JSON.stringify({...cur, ...patch})); }
+
+async function cloudSyncInvoices(list){
+  if(!CLOUD_ENABLED) return;
+  try{
+    for(let i=0;i<list.length;i+=450){
+      const chunk=list.slice(i,i+450);
+      const writes=chunk.map(inv=>({ update:{ name:docName('invoices', inv.id), fields: fsToFields(inv) } }));
+      if(writes.length) await fsBatchWrite(writes);
+    }
+    setCloudSyncStatus({lastSyncAt:new Date().toISOString(), lastError:null, invoiceCount:list.length});
+  }catch(e){
+    setCloudSyncStatus({lastError:String(e.message||e), lastErrorAt:new Date().toISOString()});
+  }
+}
+async function cloudDeleteInvoice(id){
+  if(!CLOUD_ENABLED) return;
+  try{ await fsDeleteDoc('invoices', id); }catch(e){ /* non-fatal, will be cleaned up on next full restore review */ }
+}
+async function cloudSyncMeta(docId, dataObj){
+  if(!CLOUD_ENABLED) return;
+  try{ await fsSetDoc('meta', docId, dataObj); setCloudSyncStatus({lastSyncAt:new Date().toISOString(), lastError:null}); }
+  catch(e){ setCloudSyncStatus({lastError:String(e.message||e), lastErrorAt:new Date().toISOString()}); }
+}
+
+async function runCloudMigrationIfNeeded(){
+  if(!CLOUD_ENABLED) return;
+  if(localStorage.getItem(CLOUD_MIGRATED_KEY)) return;
+  try{
+    const invoices=loadInvoices();
+    for(let i=0;i<invoices.length;i+=450){
+      const chunk=invoices.slice(i,i+450);
+      const writes=chunk.map(inv=>({ update:{ name:docName('invoices', inv.id), fields: fsToFields(inv) } }));
+      if(writes.length) await fsBatchWrite(writes);
+    }
+    await fsSetDoc('meta','settings', loadSettings());
+    await fsSetDoc('meta','menu', {list:loadMenu()});
+    await fsSetDoc('meta','customers', {list:loadCustomers()});
+    await fsSetDoc('meta','seq', loadSeq());
+    localStorage.setItem(CLOUD_MIGRATED_KEY,'1');
+    setCloudSyncStatus({lastSyncAt:new Date().toISOString(), lastError:null, invoiceCount:invoices.length, migrated:true});
+  }catch(e){
+    setCloudSyncStatus({lastError:String(e.message||e), lastErrorAt:new Date().toISOString()});
+    // leave CLOUD_MIGRATED_KEY unset so it retries on next load
+  }
+}
+
+async function restoreFromCloud(){
+  const invoiceDocs=await fsListCollection('invoices');
+  const invoices=invoiceDocs.map(d=>d.data);
+  const settings=await fsGetDoc('meta','settings');
+  const menuDoc=await fsGetDoc('meta','menu');
+  const customersDoc=await fsGetDoc('meta','customers');
+  const seq=await fsGetDoc('meta','seq');
+  localStorage.setItem(DB_KEY, JSON.stringify(invoices));
+  if(settings) localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  if(menuDoc) localStorage.setItem(MENU_KEY, JSON.stringify(menuDoc.list||[]));
+  if(customersDoc) localStorage.setItem(CUSTOMERS_KEY, JSON.stringify(customersDoc.list||[]));
+  if(seq) localStorage.setItem(SEQ_KEY, JSON.stringify(seq));
+  localStorage.setItem(SEED_FLAG_KEY,'1');
+  localStorage.setItem(CLOUD_MIGRATED_KEY,'1');
+  setCloudSyncStatus({lastSyncAt:new Date().toISOString(), lastError:null, invoiceCount:invoices.length});
+  return invoices.length;
+}
+
 /* ---------- storage helpers ---------- */
 const DB_KEY='anickas_invoices_v1';
 const SETTINGS_KEY='anickas_settings_v1';
@@ -626,11 +773,11 @@ const DEFAULT_SETTINGS={
 };
 
 function loadInvoices(){ try{return JSON.parse(localStorage.getItem(DB_KEY))||[];}catch(e){return [];} }
-function saveInvoices(list){ localStorage.setItem(DB_KEY, JSON.stringify(list)); }
+function saveInvoices(list){ localStorage.setItem(DB_KEY, JSON.stringify(list)); cloudSyncInvoices(list); }
 function loadSettings(){ try{return {...DEFAULT_SETTINGS, ...(JSON.parse(localStorage.getItem(SETTINGS_KEY))||{})};}catch(e){return DEFAULT_SETTINGS;} }
-function saveSettings(s){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+function saveSettings(s){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); cloudSyncMeta('settings', s); }
 function loadSeq(){ try{return JSON.parse(localStorage.getItem(SEQ_KEY))||{};}catch(e){return {};} }
-function saveSeq(s){ localStorage.setItem(SEQ_KEY, JSON.stringify(s)); }
+function saveSeq(s){ localStorage.setItem(SEQ_KEY, JSON.stringify(s)); cloudSyncMeta('seq', s); }
 
 /* ---------- menu catalog (prepopulated from Anicka's real order history) ---------- */
 const MENU_KEY='anickas_menu_v1';
@@ -708,7 +855,7 @@ function loadMenu(){
   saveMenu(DEFAULT_MENU);
   return DEFAULT_MENU.slice();
 }
-function saveMenu(list){ localStorage.setItem(MENU_KEY, JSON.stringify(list)); }
+function saveMenu(list){ localStorage.setItem(MENU_KEY, JSON.stringify(list)); cloudSyncMeta('menu', {list}); }
 function menuCategories(){ const m=loadMenu(); return [...new Set(m.map(i=>i.cat))]; }
 function bakeableCategories(){ return menuCategories().filter(c=>c!=='Delivery'); }
 function popularItem(cat){
@@ -767,7 +914,7 @@ function loadCustomers(){
   saveCustomers(DEFAULT_CUSTOMERS);
   return DEFAULT_CUSTOMERS.slice();
 }
-function saveCustomers(list){ localStorage.setItem(CUSTOMERS_KEY, JSON.stringify(list)); }
+function saveCustomers(list){ localStorage.setItem(CUSTOMERS_KEY, JSON.stringify(list)); cloudSyncMeta('customers', {list}); }
 function findCustomer(name){ return loadCustomers().find(c=>c.name===name); }
 
 /* ---------- cake builder options ---------- */
@@ -2046,6 +2193,7 @@ function renderDetail(app){
   document.getElementById('del-btn').onclick=()=>{
     if(confirm('Delete invoice #'+displayInvoiceNumber(inv)+'? This cannot be undone.')){
       saveInvoices(loadInvoices().filter(i=>i.id!==inv.id));
+      cloudDeleteInvoice(inv.id);
       state.view='home'; render();
     }
   };
@@ -2130,9 +2278,106 @@ function renderSettings(app){
     <button class="btn-secondary" id="manage-menu-btn">Manage Menu Items</button>
     <button class="btn-secondary" id="manage-cust-btn">Manage Customers</button>
     <button class="btn-secondary" id="restore-july-btn">Restore All 2026 Invoices</button>
+
+    <div class="kv-card" style="margin-top:20px;border-color:var(--berry);" id="cloud-status-card">
+      <h4 style="font-size:12.5px;text-transform:uppercase;color:var(--ink-soft);margin-bottom:8px;">Cloud Backup</h4>
+      <div id="cloud-status-text" style="font-size:13.5px;color:var(--ink-soft);margin-bottom:10px;">Checking status…</div>
+      <button class="btn-secondary" id="cloud-sync-now-btn" style="margin-top:0;">Sync Now</button>
+      <button class="btn-secondary" id="cloud-restore-btn">Restore From Cloud (Replace This Device)</button>
+    </div>
+
+    <div class="kv-card" style="margin-top:20px;">
+      <h4 style="font-size:12.5px;text-transform:uppercase;color:var(--ink-soft);margin-bottom:8px;">Backup &amp; Restore</h4>
+      <p class="hint" style="margin-top:0;margin-bottom:12px;">All data lives only on this device. If this phone is lost, damaged, or the app is deleted, everything is gone unless you've backed it up. Export a backup regularly and save the file somewhere safe (email it to yourself, save to iCloud/Google Drive).</p>
+      <button class="btn-secondary" id="export-backup-btn" style="margin-top:0;">Download Full Backup</button>
+      <button class="btn-secondary" id="import-backup-btn">Restore From Backup File</button>
+      <input type="file" id="import-backup-file" accept="application/json" style="display:none;">
+    </div>
+
     <p class="hint" style="text-align:center;margin-top:16px;">All data is stored only on this device.</p>
   `;
   app.appendChild(content);
+
+  function renderCloudStatus(){
+    const st=getCloudSyncStatus();
+    const el=document.getElementById('cloud-status-text');
+    if(!el) return;
+    if(st.lastError){
+      el.innerHTML=`⚠️ Last sync failed (${escapeHtml(st.lastError)}). Will retry automatically on next save, or tap Sync Now.${st.lastSyncAt?'<br>Last successful sync: '+new Date(st.lastSyncAt).toLocaleString('en-ZA'):''}`;
+    } else if(st.lastSyncAt){
+      el.innerHTML=`✅ Last synced ${new Date(st.lastSyncAt).toLocaleString('en-ZA')}${st.invoiceCount?' · '+st.invoiceCount+' invoices backed up':''}`;
+    } else {
+      el.textContent='Not yet synced — will sync automatically in the background.';
+    }
+  }
+  renderCloudStatus();
+  document.getElementById('cloud-sync-now-btn').onclick=async ()=>{
+    showToast('Syncing…');
+    await cloudSyncInvoices(loadInvoices());
+    await cloudSyncMeta('settings', loadSettings());
+    await cloudSyncMeta('menu', {list:loadMenu()});
+    await cloudSyncMeta('customers', {list:loadCustomers()});
+    await cloudSyncMeta('seq', loadSeq());
+    renderCloudStatus();
+    const st=getCloudSyncStatus();
+    showToast(st.lastError ? 'Sync failed — check connection' : 'Synced to cloud');
+  };
+  document.getElementById('cloud-restore-btn').onclick=async ()=>{
+    if(!confirm("Restore from the cloud backup? This will REPLACE everything currently on this device with whatever is in the cloud. Only do this on a new/replacement phone, or if this device's data is broken.")) return;
+    showToast('Restoring…');
+    try{
+      const count=await restoreFromCloud();
+      showToast(`Restored ${count} invoices from cloud`);
+      state.view='home'; render();
+    }catch(e){
+      showToast('Restore failed — check internet connection and try again');
+    }
+  };
+  document.getElementById('export-backup-btn').onclick=()=>{
+    const backup={
+      exportedAt:new Date().toISOString(),
+      invoices:loadInvoices(),
+      settings:loadSettings(),
+      seq:loadSeq(),
+      menu:loadMenu(),
+      customers:loadCustomers(),
+      weeklyBakes:JSON.parse(localStorage.getItem(WEEKLY_BAKES_KEY)||'null')
+    };
+    const blob=new Blob([JSON.stringify(backup,null,1)], {type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    const stamp=todayISO();
+    a.href=url; a.download=`anickas-backup-${stamp}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    showToast('Backup downloaded');
+  };
+  document.getElementById('import-backup-btn').onclick=()=>{
+    document.getElementById('import-backup-file').click();
+  };
+  document.getElementById('import-backup-file').onchange=(e)=>{
+    const file=e.target.files[0];
+    if(!file) return;
+    const reader=new FileReader();
+    reader.onload=(evt)=>{
+      let backup;
+      try{ backup=JSON.parse(evt.target.result); }
+      catch(err){ showToast('That file could not be read'); return; }
+      if(!backup.invoices){ showToast('That does not look like a valid backup file'); return; }
+      const count=backup.invoices.length||0;
+      if(!confirm(`Restore this backup? It contains ${count} invoice(s) from ${backup.exportedAt?fmtDate(backup.exportedAt.slice(0,10)):'an unknown date'}.\n\nThis will REPLACE everything currently on this device.`)) return;
+      saveInvoices(backup.invoices||[]);
+      if(backup.settings) saveSettings(backup.settings);
+      if(backup.seq) saveSeq(backup.seq);
+      if(backup.menu) saveMenu(backup.menu);
+      if(backup.customers) saveCustomers(backup.customers);
+      if(backup.weeklyBakes) localStorage.setItem(WEEKLY_BAKES_KEY, JSON.stringify(backup.weeklyBakes));
+      localStorage.setItem(SEED_FLAG_KEY,'1');
+      showToast('Backup restored');
+      state.view='home'; render();
+    };
+    reader.readAsText(file);
+  };
   document.getElementById('restore-july-btn').onclick=()=>{
     const existing=loadInvoices();
     const existingNumbers=new Set(existing.map(i=>i.number));
@@ -2344,6 +2589,7 @@ function fmtDateShort(iso){
 
 runOneTimeSeed();
 render();
+runCloudMigrationIfNeeded();
 </script>
 </body>
 </html>
